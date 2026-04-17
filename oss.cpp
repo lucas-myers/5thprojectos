@@ -15,23 +15,17 @@
 #include <sys/msg.h>
 #include <sys/wait.h>
 
-
-
-int availableResources[NUM_RESOURCES];
-
 using namespace std;
 
 const int MAX_TOTAL_PROCESSES = 20;
 const int PCB_SIZE = 18;
-const unsigned int BILLION = 1000000000;
-const unsigned int BASE_QUANTUM = 25000000;   // 25ms
-const unsigned int BLOCK_TIME = 100000000;    // 100ms
-const unsigned int IDLE_INCREMENT = 100000;   // 100 microseconds
-const unsigned int DISPATCH_OVERHEAD = 1000;  // 1000 ns
-const unsigned int UNBLOCK_OVERHEAD = 5000;   // 5000 ns
-const int MAX_LOG_LINES = 10000;
-const int NUM_RESOURCES = 10; //resource
+const int NUM_RESOURCES = 10;
 const int MAX_INSTANCES = 5;
+const unsigned int BILLION = 1000000000;
+const unsigned int CLOCK_INCREMENT = 10000000;   // 10 ms
+const unsigned int IDLE_INCREMENT = 100000;      // 100 microseconds
+const unsigned int DISPATCH_OVERHEAD = 1000;
+const int MAX_LOG_LINES = 10000;
 
 struct SimClock {
     unsigned int seconds;
@@ -42,19 +36,14 @@ struct PCB {
     int occupied;
     pid_t pid;
     int localPid;
-
     unsigned int startSeconds;
     unsigned int startNano;
-
     unsigned int serviceTimeSeconds;
     unsigned int serviceTimeNano;
-
     unsigned int eventWaitSec;
     unsigned int eventWaitNano;
-
     int blocked;
 
-    // PROJECT 5
     int resourcesAllocated[NUM_RESOURCES];
     int requestedResource;
 };
@@ -62,7 +51,7 @@ struct PCB {
 struct Message {
     long mtype;
     int index;
-    int quantum;
+    int resource;
 };
 
 int shmId = -1;
@@ -71,6 +60,7 @@ SimClock* simClock = nullptr;
 
 PCB processTable[PCB_SIZE];
 queue<int> readyQueue;
+
 int availableResources[NUM_RESOURCES];
 
 int totalChildren = 5;
@@ -91,11 +81,13 @@ unsigned int nextLaunchNano = 0;
 unsigned int nextTablePrintSec = 0;
 unsigned int nextTablePrintNano = 500000000;
 
-unsigned long long cpuBusyTime = 0;
-unsigned long long systemOverheadTime = 0;
-unsigned long long idleTime = 0;
+unsigned long long totalRequests = 0;
+unsigned long long grantedImmediately = 0;
+unsigned long long totalReleases = 0;
 
 void writeLog(const string& text) {
+    cout << text;
+
     if (logLines < MAX_LOG_LINES) {
         logFile << text;
         logLines++;
@@ -233,12 +225,6 @@ int getFreePCB() {
     return -1;
 }
 
-void addServiceTime(int index, unsigned int ns) {
-    addToTime(processTable[index].serviceTimeSeconds,
-              processTable[index].serviceTimeNano,
-              ns);
-}
-
 void removeFromPCB(int index) {
     processTable[index].occupied = 0;
     processTable[index].pid = 0;
@@ -269,32 +255,43 @@ bool timeToLaunch() {
                        nextLaunchSec, nextLaunchNano);
 }
 
-void printReadyQueue() {
-    queue<int> temp = readyQueue;
-    string line = "OSS: Ready queue [ ";
-
-    while (!temp.empty()) {
-        int index = temp.front();
-        temp.pop();
-        line += "P" + to_string(index) + " ";
-    }
-
-    line += "]\n";
-    writeLog(line);
-}
-
 void printBlockedList() {
     ostringstream out;
-    out << "OSS: Blocked queue [ ";
+    out << "OSS: Blocked processes [ ";
 
     for (int i = 0; i < PCB_SIZE; i++) {
         if (processTable[i].occupied && processTable[i].blocked) {
-            out << "P" << i << " ";
+            out << "P" << i << "(R" << processTable[i].requestedResource << ") ";
         }
     }
 
     out << "]\n";
     writeLog(out.str());
+}
+
+void printResourceTable() {
+    ostringstream out;
+    out << "OSS: Available resources: ";
+    for (int i = 0; i < NUM_RESOURCES; i++) {
+        out << "R" << i << ":" << availableResources[i] << " ";
+    }
+    out << "\n";
+    writeLog(out.str());
+
+    writeLog("OSS: Allocated resources per process:\n");
+    for (int i = 0; i < PCB_SIZE; i++) {
+        if (!processTable[i].occupied) {
+            continue;
+        }
+
+        ostringstream row;
+        row << "P" << i << ": ";
+        for (int j = 0; j < NUM_RESOURCES; j++) {
+            row << processTable[i].resourcesAllocated[j] << " ";
+        }
+        row << "\n";
+        writeLog(row.str());
+    }
 }
 
 void printProcessTable() {
@@ -308,9 +305,8 @@ void printProcessTable() {
         << setw(10) << "Local"
         << setw(12) << "StartSec"
         << setw(12) << "StartNano"
-        << setw(12) << "ServSec"
-        << setw(12) << "ServNano"
         << setw(10) << "Blocked"
+        << setw(10) << "ReqRes"
         << "\n";
     writeLog(out.str());
 
@@ -327,9 +323,8 @@ void printProcessTable() {
             << setw(10) << processTable[i].localPid
             << setw(12) << processTable[i].startSeconds
             << setw(12) << processTable[i].startNano
-            << setw(12) << processTable[i].serviceTimeSeconds
-            << setw(12) << processTable[i].serviceTimeNano
             << setw(10) << processTable[i].blocked
+            << setw(10) << processTable[i].requestedResource
             << "\n";
         writeLog(row.str());
     }
@@ -346,10 +341,8 @@ void launchWorker(int index) {
     }
 
     if (pid == 0) {
-        string burstStr = to_string(timeLimitForChildren);
         string indexStr = to_string(index);
-
-        execl("./worker", "worker", burstStr.c_str(), indexStr.c_str(), (char*)nullptr);
+        execl("./worker", "worker", indexStr.c_str(), (char*)nullptr);
         perror("execl");
         exit(1);
     }
@@ -376,24 +369,47 @@ void launchWorker(int index) {
              to_string(simClock->nanoseconds) + "\n");
 }
 
+void releaseAllResources(int index) {
+    ostringstream out;
+    out << "OSS: Releasing all resources from P" << index << ": ";
+
+    bool releasedAny = false;
+    for (int i = 0; i < NUM_RESOURCES; i++) {
+        if (processTable[index].resourcesAllocated[i] > 0) {
+            availableResources[i] += processTable[index].resourcesAllocated[i];
+            out << "R" << i << ":" << processTable[index].resourcesAllocated[i] << " ";
+            processTable[index].resourcesAllocated[i] = 0;
+            releasedAny = true;
+        }
+    }
+
+    processTable[index].requestedResource = -1;
+
+    if (releasedAny) {
+        out << "\n";
+        writeLog(out.str());
+    }
+}
+
 void checkBlockedProcesses() {
     for (int i = 0; i < PCB_SIZE; i++) {
         if (processTable[i].occupied && processTable[i].blocked) {
-            if (timeReached(simClock->seconds, simClock->nanoseconds,
-                            processTable[i].eventWaitSec,
-                            processTable[i].eventWaitNano)) {
+            int requested = processTable[i].requestedResource;
 
+            if (requested >= 0 && requested < NUM_RESOURCES &&
+                availableResources[requested] > 0) {
+
+                availableResources[requested]--;
+                processTable[i].resourcesAllocated[requested]++;
                 processTable[i].blocked = 0;
+                processTable[i].requestedResource = -1;
                 readyQueue.push(i);
 
-                writeLog("OSS: Unblocking process with PID " +
-                         to_string(processTable[i].pid) +
-                         " and putting it in ready queue at time " +
+                writeLog("OSS: Unblocking P" + to_string(i) +
+                         " and granting R" + to_string(requested) +
+                         " at time " +
                          to_string(simClock->seconds) + ":" +
                          to_string(simClock->nanoseconds) + "\n");
-
-                advanceClock(UNBLOCK_OVERHEAD);
-                systemOverheadTime += UNBLOCK_OVERHEAD;
             }
         }
     }
@@ -403,7 +419,7 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
     signal(SIGALRM, signalHandler);
-    alarm(3);
+    alarm(5);
 
     parseArguments(argc, argv);
 
@@ -451,8 +467,9 @@ int main(int argc, char* argv[]) {
     }
 
     initProcessTable();
+
     for (int i = 0; i < NUM_RESOURCES; i++) {
-    availableResources[i] = MAX_INSTANCES;
+        availableResources[i] = MAX_INSTANCES;
     }
 
     setNextLaunchTime(0.0);
@@ -473,32 +490,25 @@ int main(int argc, char* argv[]) {
 
             setNextLaunchTime(launchInterval);
             advanceClock(DISPATCH_OVERHEAD);
-            systemOverheadTime += DISPATCH_OVERHEAD;
         }
 
         checkBlockedProcesses();
 
         if (!readyQueue.empty()) {
-            printReadyQueue();
-
             int index = readyQueue.front();
             readyQueue.pop();
             pid_t childPid = processTable[index].pid;
 
-            writeLog("OSS: Dispatching process with PID " +
-                     to_string(childPid) +
-                     " from ready queue at time " +
+            writeLog("OSS: Dispatching process P" + to_string(index) +
+                     " PID " + to_string(childPid) +
+                     " at time " +
                      to_string(simClock->seconds) + ":" +
                      to_string(simClock->nanoseconds) + "\n");
-
-            advanceClock(DISPATCH_OVERHEAD);
-            systemOverheadTime += DISPATCH_OVERHEAD;
-            writeLog("OSS: total time this dispatch was 1000 nanoseconds\n");
 
             Message dispatchMsg;
             dispatchMsg.mtype = childPid;
             dispatchMsg.index = index;
-            dispatchMsg.quantum = BASE_QUANTUM;
+            dispatchMsg.resource = 1;
 
             if (msgsnd(msgId, &dispatchMsg, sizeof(Message) - sizeof(long), 0) == -1) {
                 perror("msgsnd");
@@ -515,87 +525,81 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
 
-            int usedTime = replyMsg.quantum;
+            int action = replyMsg.resource;
 
-            if (usedTime < 0) {
-                usedTime = -usedTime;
+            if (action == 0) {
+                writeLog("OSS: Process P" + to_string(index) +
+                         " is terminating at time " +
+                         to_string(simClock->seconds) + ":" +
+                         to_string(simClock->nanoseconds) + "\n");
 
-                writeLog("OSS: Receiving that process with PID " +
-                         to_string(childPid) +
-                         " terminated after running for " +
-                         to_string(usedTime) + " nanoseconds\n");
-
-                advanceClock(static_cast<unsigned int>(usedTime));
-                cpuBusyTime += static_cast<unsigned int>(usedTime);
-                addServiceTime(index, static_cast<unsigned int>(usedTime));
-
+                releaseAllResources(index);
                 waitpid(childPid, nullptr, 0);
-
                 removeFromPCB(index);
                 runningNow--;
                 finishedTotal++;
-
-                writeLog("OSS: Process with PID " +
-                         to_string(childPid) +
-                         " removed from system\n");
             }
-            else if (usedTime < static_cast<int>(BASE_QUANTUM)) {
-                writeLog("OSS: Receiving that process with PID " +
-                         to_string(childPid) +
-                         " ran for " + to_string(usedTime) +
-                         " nanoseconds\n");
-                writeLog("OSS: not using its entire time quantum\n");
-                writeLog("OSS: Putting process with PID " +
-                         to_string(childPid) +
-                         " into blocked queue\n");
+            else if (action > 0) {
+                int requested = action - 1;
+                totalRequests++;
 
-                advanceClock(static_cast<unsigned int>(usedTime));
-                cpuBusyTime += static_cast<unsigned int>(usedTime);
-                addServiceTime(index, static_cast<unsigned int>(usedTime));
+                writeLog("OSS: Process P" + to_string(index) +
+                         " requested R" + to_string(requested) +
+                         " at time " +
+                         to_string(simClock->seconds) + ":" +
+                         to_string(simClock->nanoseconds) + "\n");
 
-                processTable[index].blocked = 1;
-                processTable[index].eventWaitSec = simClock->seconds;
-                processTable[index].eventWaitNano = simClock->nanoseconds;
-                addToTime(processTable[index].eventWaitSec,
-                          processTable[index].eventWaitNano,
-                          BLOCK_TIME);
+                if (requested >= 0 && requested < NUM_RESOURCES &&
+                    availableResources[requested] > 0 &&
+                    processTable[index].resourcesAllocated[requested] < MAX_INSTANCES) {
 
-                writeLog("OSS: Process with PID " +
-                         to_string(childPid) +
-                         " will unblock at time " +
-                         to_string(processTable[index].eventWaitSec) + ":" +
-                         to_string(processTable[index].eventWaitNano) + "\n");
+                    availableResources[requested]--;
+                    processTable[index].resourcesAllocated[requested]++;
+                    processTable[index].requestedResource = -1;
+                    grantedImmediately++;
+
+                    writeLog("OSS: Granting P" + to_string(index) +
+                             " request for R" + to_string(requested) + "\n");
+
+                    readyQueue.push(index);
+                } else {
+                    processTable[index].blocked = 1;
+                    processTable[index].requestedResource = requested;
+
+                    writeLog("OSS: Blocking P" + to_string(index) +
+                             " waiting for R" + to_string(requested) + "\n");
+                }
             }
             else {
-                writeLog("OSS: Receiving that process with PID " +
-                         to_string(childPid) +
-                         " ran for " + to_string(usedTime) +
-                         " nanoseconds\n");
+                int released = (-action) - 1;
 
-                advanceClock(static_cast<unsigned int>(usedTime));
-                cpuBusyTime += static_cast<unsigned int>(usedTime);
-                addServiceTime(index, static_cast<unsigned int>(usedTime));
+                if (released >= 0 && released < NUM_RESOURCES &&
+                    processTable[index].resourcesAllocated[released] > 0) {
+
+                    processTable[index].resourcesAllocated[released]--;
+                    availableResources[released]++;
+                    totalReleases++;
+
+                    writeLog("OSS: Process P" + to_string(index) +
+                             " released R" + to_string(released) +
+                             " at time " +
+                             to_string(simClock->seconds) + ":" +
+                             to_string(simClock->nanoseconds) + "\n");
+                }
 
                 readyQueue.push(index);
+            }
 
-                writeLog("OSS: Putting process with PID " +
-                         to_string(childPid) +
-                         " into ready queue\n");
-            }
+            advanceClock(CLOCK_INCREMENT);
         } else {
-            if (launchedTotal < totalChildren && !timeToLaunch()) {
-                advanceClock(IDLE_INCREMENT);
-                idleTime += IDLE_INCREMENT;
-            } else if (runningNow > 0) {
-                advanceClock(IDLE_INCREMENT);
-                idleTime += IDLE_INCREMENT;
-            }
+            advanceClock(IDLE_INCREMENT);
         }
 
         if (timeReached(simClock->seconds, simClock->nanoseconds,
                         nextTablePrintSec, nextTablePrintNano)) {
             printProcessTable();
             printBlockedList();
+            printResourceTable();
             addToTime(nextTablePrintSec, nextTablePrintNano, 500000000);
         }
     }
@@ -603,29 +607,25 @@ int main(int argc, char* argv[]) {
     while (waitpid(-1, nullptr, WNOHANG) > 0) {
     }
 
-    unsigned long long totalSimulatedTime =
-        static_cast<unsigned long long>(simClock->seconds) * BILLION +
-        simClock->nanoseconds;
+    ostringstream report;
+    report << "\nOSS: Final report\n";
+    report << "OSS: Total processes launched: " << launchedTotal << "\n";
+    report << "OSS: Total processes finished: " << finishedTotal << "\n";
+    report << "OSS: Total requests: " << totalRequests << "\n";
+    report << "OSS: Total releases: " << totalReleases << "\n";
 
-    double cpuUtilization = 0.0;
-    if (totalSimulatedTime > 0) {
-        cpuUtilization =
-            (static_cast<double>(cpuBusyTime) / static_cast<double>(totalSimulatedTime)) * 100.0;
+    double percentGranted = 0.0;
+    if (totalRequests > 0) {
+        percentGranted =
+            (static_cast<double>(grantedImmediately) / static_cast<double>(totalRequests)) * 100.0;
     }
 
-    writeLog("\nOSS: Total processes launched: " + to_string(launchedTotal) + "\n");
-    writeLog("OSS: Total processes finished: " + to_string(finishedTotal) + "\n");
-    writeLog("OSS: Total CPU busy time: " + to_string(cpuBusyTime) + " ns\n");
-    writeLog("OSS: Total system overhead time: " + to_string(systemOverheadTime) + " ns\n");
-    writeLog("OSS: Total idle time: " + to_string(idleTime) + " ns\n");
-    writeLog("OSS: Simulation finished at time " +
-             to_string(simClock->seconds) + ":" +
-             to_string(simClock->nanoseconds) + "\n");
+    report << fixed << setprecision(2)
+           << "OSS: Percent granted immediately: " << percentGranted << "%\n";
+    report << "OSS: Simulation finished at time "
+           << simClock->seconds << ":" << simClock->nanoseconds << "\n";
 
-    ostringstream finalReport;
-    finalReport << fixed << setprecision(2)
-                << "OSS: Average CPU utilization: " << cpuUtilization << "%\n";
-    writeLog(finalReport.str());
+    writeLog(report.str());
 
     cleanup();
     logFile.close();

@@ -5,36 +5,31 @@
 #include <sys/ipc.h>
 #include <sys/msg.h>
 
+using namespace std;
+
 const int NUM_RESOURCES = 10;
 const int MAX_INSTANCES = 5;
-
-using namespace std;
 
 struct Message {
     long mtype;
     int index;
-    int quantum;
+    int resource;
 };
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
+    if (argc < 2) {
         cerr << "worker: missing arguments\n";
         return 1;
     }
 
-    double burstLimitSeconds = atof(argv[1]);
-    int localIndex = atoi(argv[2]);
+    int localIndex = atoi(argv[1]);
 
-    int totalBurstNano = static_cast<int>(burstLimitSeconds * 1000000000.0);
-    if (totalBurstNano <= 0) {
-        totalBurstNano = 1000000;
+    int resourcesOwned[NUM_RESOURCES];
+    for (int i = 0; i < NUM_RESOURCES; i++) {
+        resourcesOwned[i] = 0;
     }
 
-    int usedSoFar = 0;
-
     srand(static_cast<unsigned int>(getpid() ^ time(nullptr)));
-
-    usleep(100000);
 
     key_t msgKey = ftok(".", 75);
     if (msgKey == -1) {
@@ -56,16 +51,36 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        int quantum = msg.quantum;
-        int remaining = totalBurstNano - usedSoFar;
-
         Message reply;
         reply.mtype = 1;
         reply.index = localIndex;
+        reply.resource = 0;
 
-        if (remaining <= quantum) {
-            usedSoFar += remaining;
-            reply.quantum = -remaining;
+        int action = rand() % 100;
+
+        if (action < 70) {
+            int resourceIndex = rand() % NUM_RESOURCES;
+            reply.resource = resourceIndex + 1;
+        }
+        else if (action < 90) {
+            bool found = false;
+
+            for (int i = 0; i < NUM_RESOURCES; i++) {
+                if (resourcesOwned[i] > 0) {
+                    reply.resource = -(i + 1);
+                    resourcesOwned[i]--;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                int resourceIndex = rand() % NUM_RESOURCES;
+                reply.resource = resourceIndex + 1;
+            }
+        }
+        else {
+            reply.resource = 0;
 
             if (msgsnd(msgId, &reply, sizeof(Message) - sizeof(long), 0) == -1) {
                 perror("worker msgsnd terminate");
@@ -75,30 +90,9 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        int blockChance = rand() % 100;
-
-        if (blockChance < 20) {
-            int used = (rand() % (quantum - 1)) + 1;
-
-            if (used > remaining) {
-                used = remaining;
-            }
-
-            usedSoFar += used;
-            reply.quantum = used;
-
-            if (msgsnd(msgId, &reply, sizeof(Message) - sizeof(long), 0) == -1) {
-                perror("worker msgsnd blocked");
-                return 1;
-            }
-        } else {
-            usedSoFar += quantum;
-            reply.quantum = quantum;
-
-            if (msgsnd(msgId, &reply, sizeof(Message) - sizeof(long), 0) == -1) {
-                perror("worker msgsnd full");
-                return 1;
-            }
+        if (msgsnd(msgId, &reply, sizeof(Message) - sizeof(long), 0) == -1) {
+            perror("worker msgsnd");
+            return 1;
         }
     }
 

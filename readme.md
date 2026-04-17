@@ -33,7 +33,15 @@ make
 
 9. At this stage, the program successfully compiles and runs with the new data structures in place. 
 
-This step was mainly focused on preparing the system to support resource requests.
+10. Replaced the old worker CPU burst and quantum behavior with resource management behavior.
+
+11. Updated the worker so it waits for a message from oss and then randomly decides whether to request a resource, release a resource, or terminate.
+
+12. Changed the message structure so workers now communicate resource actions instead of time quantum usage.
+
+13. Modified oss so it launches the worker with only its process table index instead of burst time arguments.
+
+14. This step sets up the communication format needed for resource allocation and deadlock handling in the next stage.
 
 AI used: ChatGPT
 
@@ -46,5 +54,9 @@ Prompts:
  How do I initialize arrays inside a struct in C++?
 
 How should I design a resource table for multiple processes?
+
+How should processes request and release resources in an operating system simulation?
+
+How should blocking and unblocking work for resource allocation?
 
 Summary:
