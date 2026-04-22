@@ -3,8 +3,8 @@ CXXFLAGS = -Wall -g
 
 all: oss worker
 
-oss: oss.cpp
-	$(CXX) $(CXXFLAGS) -o oss oss.cpp
+oss: oss.cpp deadlockdetection.cpp deadlockdetection.h
+	$(CXX) $(CXXFLAGS) -o oss oss.cpp deadlockdetection.cpp
 
 worker: worker.cpp
 	$(CXX) $(CXXFLAGS) -o worker worker.cpp

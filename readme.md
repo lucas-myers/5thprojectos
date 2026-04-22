@@ -43,6 +43,18 @@ make
 
 14. This step sets up the communication format needed for resource allocation and deadlock handling in the next stage.
 
+15. Added the deadlock detection files provided and updated the project build so oss links against the deadlock detection implementation.
+
+16. Built helper logic in oss to generate the request and allocation matrices needed by the deadlock detection algorithm.
+
+17. Added a periodic deadlock detection check that runs every simulated second.
+
+18. Updated logging and final statistics so the program now reports how many times deadlock detection was run and whether a deadlock was found.
+
+19. Ran into compile Error switching computers. Giving up going to try to fix later.
+
+
+
 AI used: ChatGPT
 
 Prompts:

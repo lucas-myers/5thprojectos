@@ -14,6 +14,7 @@
 #include <sys/shm.h>
 #include <sys/msg.h>
 #include <sys/wait.h>
+#include "deadlockdetection.h"
 
 using namespace std;
 
@@ -84,6 +85,63 @@ unsigned int nextTablePrintNano = 500000000;
 unsigned long long totalRequests = 0;
 unsigned long long grantedImmediately = 0;
 unsigned long long totalReleases = 0;
+
+unsigned int nextDeadlockCheckSec = 1;
+unsigned int nextDeadlockCheckNano = 0;
+
+unsigned long long deadlockRuns = 0;
+unsigned long long deadlocksFound = 0;
+
+void buildDeadlockMatrices(int requestMatrix[], int allocatedMatrix[]) {
+    for (int i = 0; i < PCB_SIZE; i++) {
+        for (int j = 0; j < NUM_RESOURCES; j++) {
+            requestMatrix[i * NUM_RESOURCES + j] = 0;
+            allocatedMatrix[i * NUM_RESOURCES + j] = 0;
+        }
+    }
+
+    for (int i = 0; i < PCB_SIZE; i++) {
+        if (!processTable[i].occupied) {
+            continue;
+        }
+
+        for (int j = 0; j < NUM_RESOURCES; j++) {
+            allocatedMatrix[i * NUM_RESOURCES + j] = processTable[i].resourcesAllocated[j];
+        }
+
+        if (processTable[i].blocked &&
+            processTable[i].requestedResource >= 0 &&
+            processTable[i].requestedResource < NUM_RESOURCES) {
+            requestMatrix[i * NUM_RESOURCES + processTable[i].requestedResource] = 1;
+        }
+    }
+}
+
+void runDeadlockDetection() {
+    int requestMatrix[PCB_SIZE * NUM_RESOURCES];
+    int allocatedMatrix[PCB_SIZE * NUM_RESOURCES];
+
+    buildDeadlockMatrices(requestMatrix, allocatedMatrix);
+
+    writeLog("OSS: Running deadlock detection at time " +
+             to_string(simClock->seconds) + ":" +
+             to_string(simClock->nanoseconds) + "\n");
+
+    deadlockRuns++;
+
+    int isDeadlocked = deadlock(availableResources,
+                                NUM_RESOURCES,
+                                PCB_SIZE,
+                                requestMatrix,
+                                allocatedMatrix);
+
+    if (isDeadlocked) {
+        deadlocksFound++;
+        writeLog("OSS: Deadlock detected.\n");
+    } else {
+        writeLog("OSS: No deadlock detected.\n");
+    }
+}
 
 void writeLog(const string& text) {
     cout << text;
@@ -475,134 +533,140 @@ int main(int argc, char* argv[]) {
     setNextLaunchTime(0.0);
 
     while (finishedTotal < totalChildren || runningNow > 0) {
-        while (runningNow < maxSimultaneous &&
-               launchedTotal < totalChildren &&
-               timeToLaunch()) {
+    while (runningNow < maxSimultaneous &&
+           launchedTotal < totalChildren &&
+           timeToLaunch()) {
 
-            int index = getFreePCB();
-            if (index == -1) {
-                break;
-            }
-
-            launchWorker(index);
-            launchedTotal++;
-            runningNow++;
-
-            setNextLaunchTime(launchInterval);
-            advanceClock(DISPATCH_OVERHEAD);
+        int index = getFreePCB();
+        if (index == -1) {
+            break;
         }
 
-        checkBlockedProcesses();
+        launchWorker(index);
+        launchedTotal++;
+        runningNow++;
 
-        if (!readyQueue.empty()) {
-            int index = readyQueue.front();
-            readyQueue.pop();
-            pid_t childPid = processTable[index].pid;
+        setNextLaunchTime(launchInterval);
+        advanceClock(DISPATCH_OVERHEAD);
+    }
 
-            writeLog("OSS: Dispatching process P" + to_string(index) +
-                     " PID " + to_string(childPid) +
+    checkBlockedProcesses();
+
+    if (!readyQueue.empty()) {
+        int index = readyQueue.front();
+        readyQueue.pop();
+        pid_t childPid = processTable[index].pid;
+
+        writeLog("OSS: Dispatching process P" + to_string(index) +
+                 " PID " + to_string(childPid) +
+                 " at time " +
+                 to_string(simClock->seconds) + ":" +
+                 to_string(simClock->nanoseconds) + "\n");
+
+        Message dispatchMsg;
+        dispatchMsg.mtype = childPid;
+        dispatchMsg.index = index;
+        dispatchMsg.resource = 1;
+
+        if (msgsnd(msgId, &dispatchMsg, sizeof(Message) - sizeof(long), 0) == -1) {
+            perror("msgsnd");
+            killChildren();
+            cleanup();
+            return 1;
+        }
+
+        Message replyMsg;
+        if (msgrcv(msgId, &replyMsg, sizeof(Message) - sizeof(long), 1, 0) == -1) {
+            perror("msgrcv");
+            killChildren();
+            cleanup();
+            return 1;
+        }
+
+        int action = replyMsg.resource;
+
+        if (action == 0) {
+            writeLog("OSS: Process P" + to_string(index) +
+                     " is terminating at time " +
+                     to_string(simClock->seconds) + ":" +
+                     to_string(simClock->nanoseconds) + "\n");
+
+            releaseAllResources(index);
+            waitpid(childPid, nullptr, 0);
+            removeFromPCB(index);
+            runningNow--;
+            finishedTotal++;
+        }
+        else if (action > 0) {
+            int requested = action - 1;
+            totalRequests++;
+
+            writeLog("OSS: Process P" + to_string(index) +
+                     " requested R" + to_string(requested) +
                      " at time " +
                      to_string(simClock->seconds) + ":" +
                      to_string(simClock->nanoseconds) + "\n");
 
-            Message dispatchMsg;
-            dispatchMsg.mtype = childPid;
-            dispatchMsg.index = index;
-            dispatchMsg.resource = 1;
+            if (requested >= 0 && requested < NUM_RESOURCES &&
+                availableResources[requested] > 0 &&
+                processTable[index].resourcesAllocated[requested] < MAX_INSTANCES) {
 
-            if (msgsnd(msgId, &dispatchMsg, sizeof(Message) - sizeof(long), 0) == -1) {
-                perror("msgsnd");
-                killChildren();
-                cleanup();
-                return 1;
+                availableResources[requested]--;
+                processTable[index].resourcesAllocated[requested]++;
+                processTable[index].requestedResource = -1;
+                grantedImmediately++;
+
+                writeLog("OSS: Granting P" + to_string(index) +
+                         " request for R" + to_string(requested) + "\n");
+
+                readyQueue.push(index);
+            } else {
+                processTable[index].blocked = 1;
+                processTable[index].requestedResource = requested;
+
+                writeLog("OSS: Blocking P" + to_string(index) +
+                         " waiting for R" + to_string(requested) + "\n");
             }
+        }
+        else {
+            int released = (-action) - 1;
 
-            Message replyMsg;
-            if (msgrcv(msgId, &replyMsg, sizeof(Message) - sizeof(long), 1, 0) == -1) {
-                perror("msgrcv");
-                killChildren();
-                cleanup();
-                return 1;
-            }
+            if (released >= 0 && released < NUM_RESOURCES &&
+                processTable[index].resourcesAllocated[released] > 0) {
 
-            int action = replyMsg.resource;
-
-            if (action == 0) {
-                writeLog("OSS: Process P" + to_string(index) +
-                         " is terminating at time " +
-                         to_string(simClock->seconds) + ":" +
-                         to_string(simClock->nanoseconds) + "\n");
-
-                releaseAllResources(index);
-                waitpid(childPid, nullptr, 0);
-                removeFromPCB(index);
-                runningNow--;
-                finishedTotal++;
-            }
-            else if (action > 0) {
-                int requested = action - 1;
-                totalRequests++;
+                processTable[index].resourcesAllocated[released]--;
+                availableResources[released]++;
+                totalReleases++;
 
                 writeLog("OSS: Process P" + to_string(index) +
-                         " requested R" + to_string(requested) +
+                         " released R" + to_string(released) +
                          " at time " +
                          to_string(simClock->seconds) + ":" +
                          to_string(simClock->nanoseconds) + "\n");
-
-                if (requested >= 0 && requested < NUM_RESOURCES &&
-                    availableResources[requested] > 0 &&
-                    processTable[index].resourcesAllocated[requested] < MAX_INSTANCES) {
-
-                    availableResources[requested]--;
-                    processTable[index].resourcesAllocated[requested]++;
-                    processTable[index].requestedResource = -1;
-                    grantedImmediately++;
-
-                    writeLog("OSS: Granting P" + to_string(index) +
-                             " request for R" + to_string(requested) + "\n");
-
-                    readyQueue.push(index);
-                } else {
-                    processTable[index].blocked = 1;
-                    processTable[index].requestedResource = requested;
-
-                    writeLog("OSS: Blocking P" + to_string(index) +
-                             " waiting for R" + to_string(requested) + "\n");
-                }
-            }
-            else {
-                int released = (-action) - 1;
-
-                if (released >= 0 && released < NUM_RESOURCES &&
-                    processTable[index].resourcesAllocated[released] > 0) {
-
-                    processTable[index].resourcesAllocated[released]--;
-                    availableResources[released]++;
-                    totalReleases++;
-
-                    writeLog("OSS: Process P" + to_string(index) +
-                             " released R" + to_string(released) +
-                             " at time " +
-                             to_string(simClock->seconds) + ":" +
-                             to_string(simClock->nanoseconds) + "\n");
-                }
-
-                readyQueue.push(index);
             }
 
-            advanceClock(CLOCK_INCREMENT);
-        } else {
-            advanceClock(IDLE_INCREMENT);
+            readyQueue.push(index);
         }
 
-        if (timeReached(simClock->seconds, simClock->nanoseconds,
-                        nextTablePrintSec, nextTablePrintNano)) {
-            printProcessTable();
-            printBlockedList();
-            printResourceTable();
-            addToTime(nextTablePrintSec, nextTablePrintNano, 500000000);
-        }
+        advanceClock(CLOCK_INCREMENT);
+    } else {
+        advanceClock(IDLE_INCREMENT);
     }
+
+    if (timeReached(simClock->seconds, simClock->nanoseconds,
+                    nextDeadlockCheckSec, nextDeadlockCheckNano)) {
+        runDeadlockDetection();
+        addToTime(nextDeadlockCheckSec, nextDeadlockCheckNano, BILLION);
+    }
+
+    if (timeReached(simClock->seconds, simClock->nanoseconds,
+                    nextTablePrintSec, nextTablePrintNano)) {
+        printProcessTable();
+        printBlockedList();
+        printResourceTable();
+        addToTime(nextTablePrintSec, nextTablePrintNano, 500000000);
+    }
+}
 
     while (waitpid(-1, nullptr, WNOHANG) > 0) {
     }
