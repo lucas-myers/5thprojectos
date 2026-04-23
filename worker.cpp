@@ -29,6 +29,9 @@ int main(int argc, char* argv[]) {
         resourcesOwned[i] = 0;
     }
 
+    // track whether the last action was a request that should now be considered granted
+    int pendingRequest = -1;
+
     srand(static_cast<unsigned int>(getpid() ^ time(nullptr)));
 
     key_t msgKey = ftok(".", 75);
@@ -51,6 +54,14 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
+        // if we got scheduled again after a request, treat that request as granted
+        if (pendingRequest != -1) {
+            if (resourcesOwned[pendingRequest] < MAX_INSTANCES) {
+                resourcesOwned[pendingRequest]++;
+            }
+            pendingRequest = -1;
+        }
+
         Message reply;
         reply.mtype = 1;
         reply.index = localIndex;
@@ -58,10 +69,13 @@ int main(int argc, char* argv[]) {
 
         int action = rand() % 100;
 
+        // 70% chance to request
         if (action < 70) {
             int resourceIndex = rand() % NUM_RESOURCES;
             reply.resource = resourceIndex + 1;
+            pendingRequest = resourceIndex;
         }
+        // 20% chance to release
         else if (action < 90) {
             bool found = false;
 
@@ -74,11 +88,14 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            // if it owns nothing, just request instead
             if (!found) {
                 int resourceIndex = rand() % NUM_RESOURCES;
                 reply.resource = resourceIndex + 1;
+                pendingRequest = resourceIndex;
             }
         }
+        // 10% chance to terminate
         else {
             reply.resource = 0;
 

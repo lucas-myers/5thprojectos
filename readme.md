@@ -53,7 +53,25 @@ make
 
 19. Ran into compile Error switching computers. Giving up going to try to fix later.
 
+20. Added deadlock resolution logic after integrating the deadlock detection code provided.
 
+21. Implemented logic in oss to build the request and allocation matrices required by the deadlock detection algorithm. These matrices are generated from the current state of the process table and resource allocation data.
+
+22. Added a periodic deadlock detection check that runs once every simulated second. Each time the check runs, the system logs whether a deadlock is present.
+
+23. Integrated a deadlock recovery strategy into oss. When a deadlock is detected, oss selects one blocked process, terminates it, and releases all of its allocated resources back to the system.
+
+24. Updated resource cleanup so that when a process is terminated due to deadlock, all of its resources are properly returned to the available resource pool and the process is removed from the system.
+
+25. Added tracking and logging for deadlock statistics, including the number of times deadlock detection was run, the number of deadlocks found, and how many processes were terminated to resolve deadlock.
+
+26. Made final improvements to the worker process so it better tracks resources it owns. The worker now keeps track of previously requested resources and assumes they are granted when it is scheduled again, allowing it to properly release resources later.
+
+27. Performed final testing to ensure the system correctly handles resource requests, blocking, unblocking, deadlock detection, and deadlock resolution without crashing.
+
+28. At this point, the system fully supports process creation, resource allocation, blocking, deadlock detection, and deadlock recovery as required by the assignment.
+
+29. Going to further test all parameters.
 
 AI used: ChatGPT
 
@@ -71,4 +89,18 @@ How should processes request and release resources in an operating system simula
 
 How should blocking and unblocking work for resource allocation?
 
+How do I build request and allocation matrices from my process table for use in a deadlock detection algorithm?
+
+How should I integrate a provided deadlock detection function into my existing system?
+
+What is a simple way to resolve deadlock by selecting and terminating a process?
+
+How can I safely release all resources held by a process when it terminates?
+
+How should the worker process keep track of resources it owns so it can release them correctly?
+
+How can I structure my main loop to periodically check for deadlock without disrupting normal scheduling?
+
 Summary:
+
+I used ChatGPT more as a support tool through creating this project, it helped guide and clarify how to transition from a scheduling to resource project. It helped a lot with providing answers on how to track the resources as well as the communication between OSS and the worker. The AI was a great help in breaking down the complex steps into smaller steps that I could understand as well as help in assisting with debugging of the program. 

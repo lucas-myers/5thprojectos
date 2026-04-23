@@ -92,6 +92,7 @@ unsigned int nextDeadlockCheckNano = 0;
 unsigned long long deadlockRuns = 0;
 unsigned long long deadlocksFound = 0;
 
+// build the flattened matrices needed by the provided deadlock code
 void buildDeadlockMatrices(int requestMatrix[], int allocatedMatrix[]) {
     for (int i = 0; i < PCB_SIZE; i++) {
         for (int j = 0; j < NUM_RESOURCES; j++) {
@@ -117,6 +118,7 @@ void buildDeadlockMatrices(int requestMatrix[], int allocatedMatrix[]) {
     }
 }
 
+// run the provided deadlock detector once every simulated second
 void runDeadlockDetection() {
     int requestMatrix[PCB_SIZE * NUM_RESOURCES];
     int allocatedMatrix[PCB_SIZE * NUM_RESOURCES];
@@ -138,6 +140,7 @@ void runDeadlockDetection() {
     if (isDeadlocked) {
         deadlocksFound++;
         writeLog("OSS: Deadlock detected.\n");
+        resolveDeadlock();
     } else {
         writeLog("OSS: No deadlock detected.\n");
     }
@@ -688,6 +691,9 @@ int main(int argc, char* argv[]) {
            << "OSS: Percent granted immediately: " << percentGranted << "%\n";
     report << "OSS: Simulation finished at time "
            << simClock->seconds << ":" << simClock->nanoseconds << "\n";
+           report << "OSS: Deadlocks found: " << deadlocksFound << "\n";
+    report << "OSS: Processes terminated to resolve deadlock: "
+        << processesKilledForDeadlock << "\n";
 
     writeLog(report.str());
 
