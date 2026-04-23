@@ -91,6 +91,10 @@ unsigned int nextDeadlockCheckNano = 0;
 
 unsigned long long deadlockRuns = 0;
 unsigned long long deadlocksFound = 0;
+unsigned long long processesKilledForDeadlock = 0;
+
+void writeLog(const string& text);
+void resolveDeadlock();
 
 // build the flattened matrices needed by the provided deadlock code
 void buildDeadlockMatrices(int requestMatrix[], int allocatedMatrix[]) {
@@ -474,6 +478,41 @@ void checkBlockedProcesses() {
             }
         }
     }
+}
+
+int findDeadlockedVictim() {
+    for (int i = 0; i < PCB_SIZE; i++) {
+        if (processTable[i].occupied && processTable[i].blocked) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void resolveDeadlock() {
+    int victim = findDeadlockedVictim();
+
+    if (victim == -1) {
+        writeLog("OSS: Deadlock detected, but no blocked victim found.\n");
+        return;
+    }
+
+    pid_t victimPid = processTable[victim].pid;
+
+    writeLog("OSS: Resolving deadlock by terminating P" +
+             to_string(victim) + " PID " + to_string(victimPid) + "\n");
+
+    releaseAllResources(victim);
+
+    kill(victimPid, SIGTERM);
+    waitpid(victimPid, nullptr, 0);
+
+    removeFromPCB(victim);
+    runningNow--;
+    finishedTotal++;
+    processesKilledForDeadlock++;
+
+    writeLog("OSS: Process P" + to_string(victim) + " terminated.\n");
 }
 
 int main(int argc, char* argv[]) {
